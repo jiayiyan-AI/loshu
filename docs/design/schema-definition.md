@@ -1,0 +1,470 @@
+# SchemaDefinition 设计
+
+> 状态：草案
+> 日期：2026-08-12
+
+`SchemaDefinition` 是一个多维表应用的完整声明：有哪些表、每张表有哪些列、数据怎么被查看、怎么被汇总成图表。它是唯一的结构真相 —— 运行时、渲染层、查询层都从它派生，没有第二份可编辑的表示。
+
+## 1. 范围
+
+| 进 | 不进 |
+| --- | --- |
+| tables（表与字段） | 自动化规则 |
+| views（视图） | 权限 / 鉴权 |
+| dashboards（仪表盘） | 持久化与编辑协议 |
+| 值模型（与结构**分开声明**） | 记录本身 |
+
+三种定义各自声明什么：
+
+| 定义 | 声明的是 | 运行时对应什么 |
+| --- | --- | --- |
+| `Table` | 一张表有哪些列、每列什么类型、什么约束 | 可写的记录集合，一行 = 一个业务实体 |
+| `View` | 一个查询：取哪张表、怎么筛选排序、附带哪些算出来的列、怎么展示 | 一批行；来自表的列可写，算出来的列只读 |
+| `Dashboard` | 一组聚合查询，以及它们绑定到哪种图表 | 统计结果，纯读 |
+
+**`SchemaDefinition` 里只有中间那一列。** 记录本身不在其中 —— 右边一列只是为了说清每种定义在跑起来之后是什么，不属于本文档描述的对象。
+
+---
+
+## 2. 总原则：与关系型数据库一一对应
+
+> **关系型数据库在 `CREATE TABLE` 里定义的，就放进 `Table`；不在那里定义的，就不放。**
+
+| `CREATE TABLE` 里能写的 | 定义里的对应物 |
+| --- | --- |
+| 列名、类型 | `kind` + `format` |
+| `NOT NULL` | `required` |
+| `UNIQUE` | `unique` |
+| `DEFAULT` | `default` |
+| `CHECK` | `minimum` / `maximum` / 格式约束 |
+| `PRIMARY KEY` | `primaryField` |
+| `FOREIGN KEY … ON DELETE` | `relation` + `onDelete` |
+| `GENERATED ALWAYS AS (表达式)` | `formula` |
+
+`JOIN` 和聚合**不在** `CREATE TABLE` 里 —— 它们属于 `SELECT` / `CREATE VIEW`，因此归视图。
+
+这条原则直接定下了两件本来会反复扯皮的事：
+
+- **沿关联取对端的列、沿关联汇总子行，都归视图**（第 8 节）。
+- **多对多必须是一张中间表；一对多的外键只能在「多」那一侧**（第 5 节）。
+
+### 代价写在明处
+
+业务用户期待的是「参与人这一列可以多选」这种直接的交互，而定义层只给单值外键。这层落差**由建表工具补** —— agent 或界面在用户说「可多选」时自动建出中间表，并把它渲染成多选控件。
+
+**定义与数据库保持一一对应，易用性在工具层解决。** 让定义为了交互便利而偏离数据库模型，代价会摊到校验、查询、迁移每一处；反过来，工具层多一层映射只花一次。
+
+---
+
+## 3. 结构与值分两层
+
+`SchemaDefinition` 只描述结构，记录不在其中。值模型独立声明，两者在类型上关联（字段 kind → 值的形状），存储上分离。
+
+```ts
+interface SchemaDefinition {
+  specFormat: 'schema/v1'
+  meta:       Meta
+  tables:     Record<Id, Table>
+  views:      Record<Id, View>
+  dashboards: Record<Id, Dashboard>
+}
+```
+
+### 3.1 一个单元格能存什么
+
+```ts
+type GeoPoint  = { lat: number; lng: number; address?: string }
+type CellValue = string | number | boolean | null | readonly string[] | GeoPoint
+```
+
+多值列（多选、多人、附件）统一用 `readonly string[]`，元素是 id。**关联列不在此列** —— 它是单值外键，见第 5 节。
+
+`GeoPoint` 是唯一的结构形状 —— 坐标不序列化成字符串塞进文本列，因为值模型本来就要单独定义，为一个字段类型多加一种形状是划算的。
+
+### 3.2 字段类型与值的对应
+
+```ts
+type ValueOf<F extends Field> =
+  F extends TextField     ? string | null :
+  F extends NumberField   ? number | null :
+  F extends SelectField   ? (F['multiple'] extends true ? readonly Id[] : Id | null) :
+  F extends RelationField ? Id | null :
+  F extends GeoField      ? GeoPoint | null :
+  /* … */ never
+```
+
+---
+
+## 4. 字段
+
+### 4.1 九个存储 kind
+
+`text · number · boolean · date · select · user · attachment · geo · relation`
+
+刻意保持窄。「电话」「邮箱」「条码」「评分」「进度」「货币」这些**不是独立的类型**，它们是 text 或 number 加一层格式约束 —— 让它们各占一个顶级类型，会把类型数量推到二十开外，而每个新类型都要在校验、渲染、查询、值定义四处各写一遍。
+
+### 4.2 格式约束往下放一层
+
+格式各自的参数跟着格式走，不上浮到字段顶层：
+
+```ts
+type NumberFormat =
+  | { kind: 'plain';    precision?: number }
+  | { kind: 'percent';  precision?: number }
+  | { kind: 'currency'; currencyCode: string; precision?: number }   // ISO 4217
+  | { kind: 'rating';   max: number }
+  | { kind: 'progress' }                                             // 0–100
+
+interface NumberField extends WritableFieldBase {
+  kind: 'number'
+  format?: NumberFormat        // 省略 = plain
+  minimum?: number
+  maximum?: number
+  default?: number
+}
+
+type TextFormat =
+  | { kind: 'plain' }
+  | { kind: 'richText' }
+  | { kind: 'email' }
+  | { kind: 'phone' }
+  | { kind: 'barcode' }
+  | { kind: 'url'; allowedSchemes?: readonly ('https' | 'http' | 'mailto')[] }
+```
+
+`currencyCode` 只有货币格式才有，`max` 只有评分才有 —— 放进各自的分支，就不会出现「一个数字列同时挂着货币代码和评分上限」这种配得出来但没意义的组合。
+
+同样的收敛用在另外两处：单选与多选合并为 `select` + `multiple?`；人员与群组合并为 `user` + `subject: 'member' | 'group'` —— 两者结构相同，区别只是查的哪本目录。
+
+### 4.3 每种 format 约束了什么
+
+按第 2 节的原则，`format` 对应 SQL 的 **DOMAIN** —— 带名字的类型加 `CHECK`：
+
+```sql
+CREATE DOMAIN email AS text CHECK (VALUE ~ '…');
+```
+
+所以 `format` 是**选一个内置 DOMAIN**，不是写一条规则。规则由引擎内置，不逐列携带正则 —— 否则每个邮箱列各存一份正则，写错一个就有一列的校验和别处不一样，正则方言还有可移植性问题。
+
+| format | 约束 | 对应 SQL |
+| --- | --- | --- |
+| `text / plain` | 无 | `text` |
+| `text / richText` | 值是富文本标记而非纯文本 | 语义差别，无 `CHECK` |
+| `text / email` | 必须是合法邮箱 | `CHECK` |
+| `text / phone` | 必须是合法电话号 | `CHECK`（宽松） |
+| `text / url` | scheme 必须在 `allowedSchemes` 内 | `CHECK` |
+| `text / barcode` | 必须是所选码制的合法编码 | `CHECK` |
+| `number / plain` | 无 | `numeric` |
+| `number / percent` | 值是比例（`1` = 100%） | 单位约定，无 `CHECK` |
+| `number / currency` | 金额，单位是 `currencyCode` | `numeric(_, precision)` |
+| `number / rating` | 整数且 `0 ≤ 值 ≤ max` | `CHECK` |
+| `number / progress` | `0 ≤ 值 ≤ 100` | `CHECK` |
+
+字段顶层的 `minimum` / `maximum` 同样是 `CHECK`，区别只是它跨所有数字格式通用。
+
+**`precision` 在两处都出现，含义不同：**
+
+| 位置 | 含义 | 影响 |
+| --- | --- | --- |
+| `Table` 的 `format.precision` | **存储精度** —— 小数存几位 | `numeric(_, n)` 的 scale，会截断真实数据 |
+| `View` 的 `presentation` | **显示位数** —— 界面上呈现几位 | 只影响呈现，不动存储 |
+
+同一张表的两个视图可以显示不同位数，但存储精度只有一份。
+
+**暂不支持自定义格式。** 「工号必须是 `EMP-` 加六位数字」这类需求就是 `CREATE DOMAIN`，加起来不难（`SchemaDefinition` 里开一个 `domains` map 供各列引用），也不违反第 2 节的原则，但它是个新概念，等真有需要再说。
+
+### 4.4 系统列
+
+值由引擎在写入时生成，用户不可编辑，无配置项：
+
+```ts
+interface SystemField extends FieldBase {
+  kind: 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'autoNumber'
+}
+```
+
+它们与算出来的列不同：系统列的值来自**写入这个动作本身**，写的那一刻定死，丢了不可重建；算出来的列的值来自**别的数据**，随时可以重算。
+
+### 4.5 基接口分层
+
+基类只放**跨类型通用**的约束；格式类的约束是各 kind 自己的事，挂在各自的 `format` 上（见 4.3）。
+
+`required`（必填）和 `unique`（不重复）是**对用户输入的约束** —— 前提是这一格的值由人填。它们因此不属于所有字段的公共基类，而属于「可写」这一层：
+
+```ts
+interface FieldBase         { name: string; description?: string; deletedAt?: number }
+interface WritableFieldBase extends FieldBase { required?: true; unique?: true }
+
+interface TextField     extends WritableFieldBase { kind: 'text';     /* … */ }
+interface RelationField extends WritableFieldBase { kind: 'relation'; /* … */ }
+interface FormulaField  extends FieldBase         { kind: 'formula';  /* … */ }
+interface SystemField   extends FieldBase         { kind: 'createdAt' | /* … */ }
+```
+
+基类**窄，按需往上加**。加法可以嵌套复用，减法不行 —— 一旦某个子类型需要「去掉」基类的属性，就说明基类设宽了，而且减错或漏减编译器不会提醒。
+
+### 4.6 「能不能写」这条线由编译器守着
+
+这个判断会被下游反复用到（写入校验、表单渲染、API 入参）。用一张必须写全的登记表来记，而不是散落各处的类型判断：
+
+```ts
+const WRITABLE_KINDS: Record<WritableField['kind'], true> = {
+  text: true, number: true, boolean: true, date: true, select: true,
+  user: true, attachment: true, geo: true, relation: true,
+}
+
+export function isWritable(f: Field): f is WritableField {
+  return f.kind in WRITABLE_KINDS
+}
+```
+
+`Record<WritableField['kind'], true>` 要求把联合类型的每个成员都列出来：新增一个可写 kind 却忘了登记 → 编译报错；把不可写的 kind 误登记进来 → 编译报错。判断只此一处，其余地方一律调 `isWritable`。
+
+> **为什么不把字段按可写性拆成多张 map。** 分表能让「不可写的列出现在可写位置」从「能检查出来」变成「根本写不出来」，但换不到任何类型推导 —— schema 是运行时从 JSON 载入的，`Table` 不是字面量类型，`Record<Id, Field>` 里哪个 key 对应哪个变体，在类型层本来就不存在。代价却是实打实的：编辑协议要先判断列属于哪张 map，改列类型如果跨 map 就得表达成「从一张搬到另一张」而不是原地改，还要额外校验两张 map 之间 id 不重复。上面那张必须写全的登记表拿到了绝大部分收益，且不动协议。
+
+---
+
+## 5. 关联
+
+关联指的是**指向本应用另一张表的某一行**。`select` / `user` / `attachment` 的格子里也存 id，但它们指向的是选项集、人员目录、附件，不是表的行，因此不属于本节。
+
+```ts
+interface RelationField extends WritableFieldBase {
+  kind: 'relation'
+  target: Id                                      // 目标表；允许自引用
+  onDelete: 'restrict' | 'cascade' | 'setNull'
+  inverse?: {                                     // 目标表上自动出现一个配对的反向列
+    field: Id                                     // 反向列的稳定 id
+    name: string
+  }
+}
+```
+
+**它就是一个外键列**：一格存一个目标行 id。没有「一格存一组 id」的形态，因为 `CREATE TABLE` 里没有。
+
+### 5.1 三种基数怎么表达
+
+| 想要的关系 | 怎么声明 | RDBMS 对应 |
+| --- | --- | --- |
+| 多对一 / 一对多 | 在**「多」那一侧**建一个 relation 列 | 外键列 |
+| 一对一 | 同上，再加 `unique: true` | 外键列 + `UNIQUE` |
+| 多对多 | 建一张中间表，两个 relation 列各指一边 | 关联表 |
+
+一对一复用了已有的 `unique`，不必新开一个开关 —— 这正是关系型数据库的做法。
+
+一对多**只能从「多」那一侧声明**：外键在子表上，一个子行指一个父行。反过来在父行的格子里存一组子行 id，`CREATE TABLE` 里没有这种写法，而且子行上万时那一格就有上万个 id。
+
+### 5.2 关系只声明一次
+
+反向列不在目标表的 `fields` 里另写一条 —— 否则「建一个双向关联」就得拆成两侧各一条声明，两次提交之间会出现「反向端指向一个不存在的列」这种不合法的中间状态。
+
+反向列由引擎在读取时自动生成，但它有一个创建时就分配好的稳定 id（改名不动它），可以被引用。**关系本身只存在持有外键的那一侧。**
+
+### 5.3 走哪个方向，决定是一行还是一堆行
+
+- **顺着外键走**（子 → 父，如 任务 → 所属项目）：走过去只有一行。下称 **to-one**。
+- **逆着外键走**（父 → 子，如 项目 → 它的任务们）：走过去是一堆行。下称 **to-many**。外键上若有 `unique`，反向也只有一行。
+
+于是每建一条关联，就同时得到一个 to-one 方向和一个 to-many 方向。to-many 不是边角情况，它是每条关联的另一半 —— 而业务上想看的数字往往正好在这一半：「这个项目有几个任务」「这个客户下了多少单」。
+
+### 5.4 走一跳，行数会不会变
+
+- **to-one 走一跳，行数不变。** 可以任意叠加，也可以连着走多跳（任务 → 项目 → 客户 → 客户经理），每跳都不改变行数。
+- **to-many 走一跳，行数会变。** 一个有 3 个任务的项目会变成 3 行。
+
+### 5.5 来自 to-many 的值必须先汇总
+
+沿 to-many 走一跳得到的是一堆行。把它接回原来的行集有两种接法，它们回答的是**两个不同的问题**。
+
+**join —— 行数变多。** 项目表的行集 join 任务表，一个有 3 个任务的项目变成 3 行，得到的是「任务列表，每行带着它所属项目的信息」。这正是要 join 的人想要的东西。
+
+**汇总 —— 行数不变，对每一行分别汇总它自己的子行。** SQL 里写成相关子查询，不是 join：
+
+```sql
+SELECT p.*, (SELECT COUNT(*) FROM task t WHERE t.project_id = p.id) FROM project p
+```
+
+3 行进、3 行出，得到的是「项目列表，每行带着它的任务数」。
+
+关键在于**后者不能由前者加工得到**：join 之后，一行代表的已经是一个任务而不是一个项目，项目自己的每一列在那 3 行里各出现一次；想变回「一行一个项目」，只能再汇总一次 —— 那不如一开始就汇总。
+
+所以「在项目这一行上显示一个来自任务表的值」，本身就是一次汇总，不是 join 的后处理。视图因此要把 join 和汇总分开声明，见 8.2。
+
+---
+
+## 6. 查询语言
+
+一套写法，视图、仪表盘、汇总列共用。
+
+### 6.1 Filter
+
+```ts
+interface FilterOperators {
+  $eq?: FilterLiteral;  $ne?: FilterLiteral
+  $in?: readonly FilterLiteral[];  $nin?: readonly FilterLiteral[]
+  $gt?: FilterLiteral;  $gte?: FilterLiteral
+  $lt?: FilterLiteral;  $lte?: FilterLiteral
+  $exists?: boolean
+  $contains?: FilterLiteral;  $startsWith?: string
+}
+
+type FilterCondition = FilterOperators | FilterLiteral   // 直接给值是简写：{ 状态: '已完成' }
+
+type Filter =
+  | { $and: readonly Filter[] }
+  | { $or:  readonly Filter[] }
+  | { $not: Filter }
+  | { [fieldId: string]: FilterCondition }
+```
+
+### 6.2 「当前用户」「最近 N 天」是值，不是运算符
+
+```ts
+type FilterLiteral =
+  | JsonPrimitive
+  | { $me: true }                                              // 当前用户
+  | { $now: true }
+  | { $daysAgo: number }
+  | { $periodStart: 'week' | 'month' | 'quarter' | 'year' }
+```
+
+另一种做法是给它开一个专用运算符，摆在 `$gt` / `$lt` 旁边：`{ createdAt: { $inLastDays: 7 } }`。不这么做，是因为那样只表达得出「最近 N 天」这一种比较；做成值则可以配任何运算符：
+
+```ts
+{ createdAt: { $gte: { $daysAgo: 7 } } }                        // 最近 7 天
+{ createdAt: { $lt:  { $daysAgo: 30 } } }                       // 30 天没动过的
+{ createdAt: { $gte: { $daysAgo: 30 }, $lt: { $daysAgo: 7 } } } // 7～30 天前
+{ 截止日:    { $lt:  { $now: true } } }                          // 已经过期的
+```
+
+后三行若走运算符那条路，得各加一个新运算符。`{ $me: true }` 同理 —— 它是值，所以 `$eq` / `$ne` / `$in` 都能拿它比较。
+
+### 6.3 汇总函数
+
+```ts
+type Aggregation = 'count' | 'distinctCount' | 'sum' | 'average' | 'min' | 'max' | 'list'
+```
+
+`list` 不合成一个数，而是把子行的值列出来（「这个项目下所有任务名」）。数值汇总和列举放在同一个枚举里 —— 它们是同一个动作（沿关联走到一堆行、收进一个格子）的不同收法，不该做成两套机制。
+
+### 6.4 Query
+
+```ts
+interface Query {                      // 行级：视图用
+  table: Id
+  filter?: Filter
+  sort?: readonly Sort[]
+  limit?: number
+}
+
+interface AggregateQuery extends Query {   // 聚合级：仪表盘用
+  dimensions?: readonly Dimension[]
+  measures:    readonly Measure[]
+  having?:     readonly Having[]
+}
+```
+
+---
+
+## 7. 表 · 视图 · 仪表盘的分界
+
+这一节比较的是**用户最终看到的东西**，不是定义本身 —— 但它决定一个算出来的值该做成表或视图的一列，还是做成仪表盘的一个指标。
+
+| | 表（含其视图） | 仪表盘 |
+| --- | --- | --- |
+| 一行是什么 | 一个你要**动它**的业务实体 | 一个统计结果 |
+| 用户在干嘛 | 逐行处理：改状态、指派、跟进 | 看对比、趋势、异常 |
+| 可写 | 是 | 否 |
+| 用多久 | 边看边改 | 看一眼就走 |
+
+判断方法一句话：**有没有人对着这一行做动作。**
+
+据此：「项目的任务数 / 完成率」是操作型 —— 项目负责人打开项目列表逐个跟进，要能排序、筛选、点进去，这是工作清单不是图表。「各客户的平均项目完成率」是分析型 —— 横向对比，看完不对某一行做动作。
+
+跨多层的汇总（客户 ← 项目 ← 任务）由仪表盘的查询层承担，不作为表列设计的依据。
+
+---
+
+## 8. 算出来的列住在哪一层
+
+按第 2 节的原则，这条线画在 `CREATE TABLE` 的边界上：
+
+| 算什么 | 归属 | RDBMS 里是什么 |
+| --- | --- | --- |
+| 同一行内的表达式 | **表** | `GENERATED ALWAYS AS (expr)` |
+| 取对端的一列 | **视图** | `JOIN` |
+| 汇总子行 | **视图** | 相关子查询 |
+
+### 8.1 表：generated column
+
+```ts
+interface FormulaField extends FieldBase {
+  kind: 'formula'
+  expression: string          // 只能引用同一行的存储列
+}
+```
+
+SQL 的 generated column 也只能引用同一行 —— 作用范围天然一致，不必额外规定。它不可写，因此继承 `FieldBase` 而不是 `WritableFieldBase`（见 4.5），也就不会带上 `required` / `unique`。
+
+### 8.2 视图：join / 汇总 / 表达式
+
+```ts
+interface View {
+  name: string
+  source: { table: Id } | { view: Id }                       // ← 见第 9 节 #1
+  joins?:      Record<Id, { via: readonly Id[]; field: Id }>  // ① to-one，可多跳，行数不变
+  aggregates?: Record<Id, { via: Id; field?: Id
+                            aggregation: Aggregation; filter?: Filter }>  // ② to-many，逐行汇总，行数不变
+  computed?:   Record<Id, { expression: string }>            // ③ 在 ①② 结果上算
+  filter?: Filter
+  sort?: readonly Sort[]
+  presentation: GridPresentation | KanbanPresentation | FormPresentation   // 列宽、显示位数、颜色等纯呈现的东西
+}
+```
+
+求值顺序固定为 **① join → ② 汇总 → ③ 表达式**，全程行数不变，始终一行一条源表记录。
+
+**视图这一层也有表达式，它和表里的 generated column 不是一回事**：generated column 只能碰同一行的存储列；视图的表达式可以用 ① ② 的结果。「完成率 = 已完成数 ÷ 任务数」属于后者 —— 两个数都是汇总出来的，表那一层碰不到。
+
+这个分工和 SQL 一致：表有 generated column，视图的 `SELECT` 列表里也可以写表达式。
+
+### 8.3 这么切的代价
+
+**同一个定义要写很多遍。** 一张表若有 5 个视图，前 4 个都要「完成率」，就各声明一遍 join + 汇总 + 表达式。定义变更要改多处，漏一处即两个页面显示不同的数。机器生成 spec 时这个成本更明显 —— 生成便宜，保持一致贵。
+
+缓解手段是允许**视图以视图为源**：一张表配一个基础视图把定义写清楚，其余视图以它为源，只叠 filter / sort / 展示。待定，见第 9 节 #1。
+
+**读接口以视图为单位。** join 和汇总出来的值只存在于视图输出里，直接查表拿不到「完成率」（表里能拿到的只有存储列、系统列和 generated column）。跨表引用这类值时，join 的目标也是视图而不是表。
+
+### 8.4 已考虑并排除的形态
+
+| 形态 | 排除理由 |
+| --- | --- |
+| 把取值与汇总也做成表的列 | `CREATE TABLE` 里没有 `JOIN` 和聚合，违反第 2 节的原则 |
+| 表达式全部下沉到视图（表里不留 generated column） | `GENERATED ALWAYS AS` 在 `CREATE TABLE` 里，同样违反原则；而且同一行内的计算本来就不需要查询层 |
+| 只提供 join + 表达式，不单设汇总声明 | join 到 to-many 之后，一行代表的是子行而不是源表的行；「一行一个项目」的汇总没法由它加工得到，见 5.5 |
+| 一律用 `GROUP BY` 重建「一行一个项目」 | 语义上可行，但项目表本来就一行一个项目，从任务表分组把它重建一遍是绕路：项目自己的每一列都要额外声明怎么合并，而逐行汇总直接表达同一意图 |
+| 字段按可写性拆成多张 map | 换不到类型推导，却明显复杂化编辑协议，见 4.6 |
+
+---
+
+## 9. 未决问题
+
+| # | 问题 | 状态 |
+| --- | --- | --- |
+| 1 | 视图能否以视图为源 | 倾向支持：这是 8.3 那个重复问题唯一干净的解法 |
+| 2 | to-one join 是否支持多跳（`via: Id[]`） | 倾向支持：每跳行数不变，是白拿的表达力 |
+| 3 | 读接口以视图为单位，对外部接口的影响面 | 需评估 |
+| 4 | 仪表盘 widget 模型（metric / donut / bar / line / table） | 未展开 |
+| 5 | 视图是否拆成「查询视图（grid / kanban）」与「录入面（form）」 | 未展开；form 没有 filter / sort，与前两者结构不同 |
+| 6 | 编辑协议与持久化 | 本文不涉及 |
+| 7 | 值模型（记录长什么样、null 语义、id 引用指向谁） | 另开一份文档 |
+
+---
+
+## 附：本文用到的两个说法
+
+| 说法 | 含义 |
+| --- | --- |
+| to-one / to-many | 顺着外键走只有一行，逆着外键走是一堆行，见 5.3 |
+| 操作型 / 分析型 | 见第 7 节，判断方法是「有没有人对着这一行做动作」 |
