@@ -69,7 +69,20 @@ interface SchemaDefinition {
   views:      Record<Id, View>
   dashboards: Record<Id, Dashboard>
 }
+
+interface Meta {
+  name: string                    // 应用名，如「洛书」
+  description?: string
+}
+
+interface Table {
+  name: string
+  primaryField: Id                // 主字段：一行的展示标题，见第 2 节
+  fields: Record<Id, Field>
+}
 ```
+
+四个顶级 map 的 key 都是 `Id`：一处声明用它，别处引用也用它（视图的 `source.table`、关联的 `target`、图表的通道，全是这些 id）。`Table` 只包字段；视图、仪表盘各自成表，见 §8.2 / 第 9 / 10 节。
 
 ### 3.1 一个单元格能存什么
 
@@ -368,12 +381,37 @@ interface Query {                      // 行级：视图用
   limit?: number
 }
 
+interface Sort {
+  field: Id                            // 存储列 / join / aggregate / computed 的 id 都行
+  direction: 'asc' | 'desc'
+}
+
 interface AggregateQuery extends Query {   // 聚合级：仪表盘用
-  dimensions?: readonly Dimension[]
-  measures:    readonly Measure[]
-  having?:     readonly Having[]
+  dimensions?: readonly Dimension[]    // GROUP BY
+  measures:    readonly Measure[]      // SELECT 里的聚合，至少一个
+  having?:     readonly Having[]        // 对聚合结果再筛
+}
+
+interface Dimension {                  // 分组的一项
+  id: Id                               // 供图表通道引用
+  field: Id
+  bucket?: 'day' | 'week' | 'month' | 'quarter' | 'year'   // 日期分桶；非日期列省略
+}
+
+interface Measure {                    // 一个聚合出来的数
+  id: Id                               // 供图表通道 / having 引用
+  aggregation: Aggregation             // 见 6.3
+  field?: Id                           // count / distinctCount 可省略，其余必填
+  filter?: Filter                      // 只统计满足条件的子集，如「已完成任务数」
+}
+
+interface Having {                     // SQL 的 HAVING：拿聚合结果比较
+  measure: Id                          // 引用某个 measure 的 id
+  condition: FilterOperators           // 复用 6.1 的运算符
 }
 ```
+
+`Dimension` / `Measure` 都带 `id`，因为仪表盘的图表要按 id 把它们接到坐标轴、系列、数值这些视觉通道上（第 10 节）。`having` 对着 `measure` 的 id 筛，正如 SQL 的 `HAVING` 只能碰聚合结果、不碰原始行。
 
 ---
 
@@ -422,14 +460,14 @@ SQL 的 generated column 也只能引用同一行 —— 作用范围天然一�
 ```ts
 interface View {
   name: string
-  source: { table: Id } | { view: Id }                       // ← 见第 9 节 #1
+  source: { table: Id } | { view: Id }                       // ← 见第 12 节 #1
   joins?:      Record<Id, { via: readonly Id[]; field: Id }>  // ① to-one，可多跳，行数不变
   aggregates?: Record<Id, { via: Id; field?: Id
                             aggregation: Aggregation; filter?: Filter }>  // ② to-many，逐行汇总，行数不变
   computed?:   Record<Id, { expression: string }>            // ③ 在 ①② 结果上算
   filter?: Filter
   sort?: readonly Sort[]
-  presentation: GridPresentation | KanbanPresentation | FormPresentation   // 列宽、显示位数、颜色等纯呈现的东西
+  presentation: Presentation                                 // 怎么展示这批行，见第 9 节
 }
 ```
 
@@ -443,7 +481,7 @@ interface View {
 
 **同一个定义要写很多遍。** 一张表若有 5 个视图，前 4 个都要「完成率」，就各声明一遍 join + 汇总 + 表达式。定义变更要改多处，漏一处即两个页面显示不同的数。机器生成 spec 时这个成本更明显 —— 生成便宜，保持一致贵。
 
-缓解手段是允许**视图以视图为源**：一张表配一个基础视图把定义写清楚，其余视图以它为源，只叠 filter / sort / 展示。待定，见第 9 节 #1。
+缓解手段是允许**视图以视图为源**：一张表配一个基础视图把定义写清楚，其余视图以它为源，只叠 filter / sort / 展示。待定，见第 12 节 #1。
 
 **读接口以视图为单位。** join 和汇总出来的值只存在于视图输出里，直接查表拿不到「完成率」（表里能拿到的只有存储列、系统列和 generated column）。跨表引用这类值时，join 的目标也是视图而不是表。
 
@@ -459,17 +497,184 @@ interface View {
 
 ---
 
-## 9. 未决问题
+## 9. 视图：查询之外，还要声明怎么展示
+
+§8.2 的 `View` 把「取哪些行」说清楚了；剩下的是「这批行怎么摆在屏幕上」—— 这就是 `presentation`。它只管呈现，不改一行数据，也不改行数。
+
+```ts
+type Presentation =
+  | GridPresentation
+  | KanbanPresentation
+  | CalendarPresentation
+  | GalleryPresentation
+  | FormPresentation
+
+interface ColumnStyle {           // 单列的呈现覆盖；key = 字段 / join / aggregate / computed 的 id
+  hidden?: true
+  width?: number                  // 像素
+  precision?: number              // 显示位数，见 4.3：只影响呈现，不动存储精度
+}
+
+interface GridPresentation {
+  kind: 'grid'
+  order?: readonly Id[]           // 列从左到右的顺序；省略 = 定义顺序
+  columns?: Record<Id, ColumnStyle>
+  frozen?: number                 // 冻结左侧几列
+  rowHeight?: 'short' | 'medium' | 'tall'
+}
+
+interface KanbanPresentation {
+  kind: 'kanban'
+  groupBy: Id                     // 按哪一列分栏，通常是 select 或 relation
+  order?: readonly Id[]           // 卡面显示哪些列、按什么顺序
+  columns?: Record<Id, ColumnStyle>
+}
+
+interface CalendarPresentation {
+  kind: 'calendar'
+  startField: Id                  // 事件落在日历上用哪个 date 列
+  endField?: Id                   // 有跨度的事件
+  titleField?: Id
+}
+
+interface GalleryPresentation {
+  kind: 'gallery'
+  coverField?: Id                 // 用哪个 attachment 列做封面
+  order?: readonly Id[]
+  columns?: Record<Id, ColumnStyle>
+}
+
+interface FormPresentation {
+  kind: 'form'
+  items: readonly FormItem[]      // 只列可写字段；顺序即渲染顺序
+  submitLabel?: string
+}
+interface FormItem {
+  field: Id
+  label?: string                  // 覆盖字段名
+  help?: string                   // 填写说明
+  required?: true                 // 表单级必填，叠加在字段级 required 之上
+}
+```
+
+**呈现里凡是指列，都用同一套 id。** grid 的 `columns`、kanban 的 `groupBy`、日历的 `startField`，key 都是 §8.2 那些 id：存储列、join、aggregate、computed 一视同仁。算出来的列在呈现层和存储列没有区别 —— 这正是 §8.2 把它们都收进视图、给统一 id 的回报。
+
+### 9.1 form 是视图的一种呈现，不是第四种顶级定义
+
+原本悬而未决（旧「视图是否拆出录入面」）：form 没有 filter / sort，跟 grid / kanban 结构不同，要不要拆成单独的东西。结论是**不拆** —— form 仍然绑在一个源表上、仍然是「把这张表的字段摆出来」，只是摆法是一张录入卡而非一个行网格。`filter` / `sort` 在 `View` 上本来就是可选的，form 不设就是了。
+
+代价写在明处：一张纯新建用的 form 不消费查询的行 —— 它的 `source` 只圈定往哪张表插、能编辑哪些既有行。为这一点差异另开一个 `forms` 顶级 map、多一个概念，换来的分离不值当；`presentation` 这个联合本来就在表达「同一个源，几种摆法」，form 就是其中一种。
+
+---
+
+## 10. 仪表盘
+
+视图 = 查询 + 怎么摆行；**仪表盘的一个 widget = 聚合查询 + 怎么把聚合结果画成图**。结构上完全对称：把 §9 的「呈现」换成「图表通道绑定」。
+
+```ts
+interface Dashboard {
+  name: string
+  widgets: Record<Id, Widget>
+  layout?: Record<Id, Box>        // 每个 widget 在 12 列网格里的位置；省略 = 按序堆叠
+}
+interface Box { x: number; y: number; w: number; h: number }
+
+interface Widget {
+  title?: string
+  query: AggregateQuery           // 见 6.4：dimensions + measures (+ having)
+  chart: Chart
+}
+
+type Chart =
+  | { kind: 'metric'; value: Id }                                    // 0 维 1 值：一个大数字
+  | { kind: 'bar' | 'line' | 'area'; x: Id; y: readonly Id[]; series?: Id }
+  | { kind: 'pie' | 'donut'; category: Id; value: Id }
+  | { kind: 'table' }                                                // 维度做行、度量做列，直接铺开
+```
+
+### 10.1 图表通道接的是 query 里的 id
+
+`chart` 上的 `value` / `x` / `y` / `category` / `series` 全是 `id`，引用同一个 widget 的 `query` 里声明的 dimension 或 measure。哪个 id 接哪个通道，就定了这张图怎么画：
+
+| kind | query 要求 | 通道 |
+| --- | --- | --- |
+| `metric` | 0 个 dimension，≥1 个 measure | `value` = 一个 measure |
+| `bar` / `line` / `area` | ≥1 个 dimension | `x` = dimension；`series?` = 第二个 dimension（分系列）；`y` = 一到多个 measure |
+| `pie` / `donut` | 1 个 dimension，1 个 measure | `category` = dimension；`value` = measure |
+| `table` | 任意 | 无需绑定：dimension 顺次做前导列，measure 做后续列 |
+
+这跟视图用同一套办法：**查询只负责算出 dimension 和 measure，怎么摆是另一层的事。** measure 换个聚合函数、dimension 换个分桶，图表通道不动；反过来 bar 改成 line 也不碰查询。二者不搅在一起，正是 §6.4 给 dimension / measure 各配一个 id 的用意。
+
+### 10.2 为什么 widget 不直接引用视图
+
+widget 自带一个 `AggregateQuery`，而不是指向某个已有 `View`。因为视图产出的是**行**（一行一条源记录），仪表盘要的是**聚合结果**（一行一个统计），两者查询形状不同（`AggregateQuery` 比 `Query` 多了 dimensions / measures / having）。让 widget 复用视图，就得允许「对视图再 GROUP BY」，那是又长一截的查询能力；直接给 widget 一个聚合查询一步到位，也和 §7「操作型 / 分析型」的分界一致：分析型的东西不必挂在操作型的视图上。
+
+---
+
+## 11. 一个完整的例子
+
+[`examples/project-tracker.json`](examples/project-tracker.json) 是一份能跑通上面所有构件的 `SchemaDefinition`：客户 / 项目 / 任务三张表，四个视图（grid / kanban / grid / form），一个总览仪表盘。挑四段看它长什么样。
+
+**字段：三条正交约束叠出一个邮箱列**（§4.3 / §4.5）
+
+```jsonc
+"fld_cust_email": { "kind": "text", "name": "联系邮箱",
+                    "format": { "kind": "email" }, "required": true, "unique": true }
+```
+
+`format: { kind: "email" }` 不是写一条正则，而是**选中引擎内置的 email DOMAIN**（`CHECK (VALUE ~ '…')`，规则在引擎里，不逐列携带）；`required` = `NOT NULL`、`unique` = `UNIQUE`。三者正交：format 管「是不是邮箱」，required/unique 管「填没填 / 重不重复」。email 格式不带参数 —— 对比同为 text 的 `官网` 用 `url` 还要配 `allowedSchemes`，「合法邮箱」是一条固定规则，没什么可配。
+
+**表：任务，带一个多值自关联和一个 generated column**（§4 / §5）
+
+```jsonc
+"fld_task_project": { "kind": "relation", "name": "所属项目", "target": "tbl_project", "onDelete": "cascade" },
+"fld_task_deps":    { "kind": "relation", "name": "前置任务", "target": "tbl_task", "multiple": true, "onDelete": "setNull" },
+"fld_task_weight":  { "kind": "formula",  "name": "加权分", "expression": "fld_task_priority * (100 - fld_task_progress)" }
+```
+
+`所属项目` 是单值关联（一个任务一个项目）；`前置任务` 是 `multiple` 自关联（一个任务可依赖多个任务）—— 正是第 5 节那套「列声明端点、链接是数据层的边」。`加权分` 只碰同一行的列，是表级的 generated column。
+
+**视图：项目清单，逐行汇总子任务再算完成率**（§8.2）
+
+```jsonc
+"aggregates": {
+  "agg_task_count": { "via": "fld_task_project", "aggregation": "count" },
+  "agg_task_done":  { "via": "fld_task_project", "aggregation": "count",
+                      "filter": { "fld_task_status": "opt_done" } }
+},
+"computed": {
+  "c_done_rate": { "expression": "agg_task_count > 0 ? agg_task_done / agg_task_count : 0" }
+}
+```
+
+`via` 指向住在任务表上、指向项目的那条关联（`fld_task_project`）—— 从项目这侧逆着走，就是「这个项目的任务们」，逐行 count（§5.5）。`c_done_rate` 在两个汇总数之上再算，行数始终不变。
+
+**仪表盘：一个 widget = 聚合查询 + 图表通道**（第 10 节）
+
+```jsonc
+"query": {
+  "table": "tbl_project",
+  "dimensions": [{ "id": "d_status", "field": "fld_proj_status" }],
+  "measures":   [{ "id": "m_count", "aggregation": "count" }]
+},
+"chart": { "kind": "bar", "x": "d_status", "y": ["m_count"] }
+```
+
+查询按状态分组、数每组项目数；图表把 `d_status` 接到 x 轴、`m_count` 接到高度。换成 `{ "kind": "donut", "category": "d_status", "value": "m_count" }` 就是同一份数据的环形图 —— 查询一个字都不用改。
+
+---
+
+## 12. 未决问题
 
 | # | 问题 | 状态 |
 | --- | --- | --- |
 | 1 | 视图能否以视图为源 | 倾向支持：这是 8.3 那个重复问题唯一干净的解法 |
 | 2 | to-one join 是否支持多跳（`via: Id[]`） | 倾向支持：每跳行数不变，是白拿的表达力 |
 | 3 | 读接口以视图为单位，对外部接口的影响面 | 需评估 |
-| 4 | 仪表盘 widget 模型（metric / donut / bar / line / table） | 未展开 |
-| 5 | 视图是否拆成「查询视图（grid / kanban）」与「录入面（form）」 | 未展开；form 没有 filter / sort，与前两者结构不同 |
-| 6 | 编辑协议与持久化 | 本文不涉及 |
-| 7 | 值模型（记录长什么样、null 语义、id 引用指向谁） | 另开一份文档 |
+| 4 | 编辑协议与持久化 | 本文不涉及 |
+| 5 | 值模型（记录长什么样、null 语义、id 引用指向谁） | 另开一份文档 |
+
+> 旧 #4（仪表盘 widget 模型）已在第 10 节展开，旧 #5（form 是否拆成独立定义）已在 §9.1 定为「不拆」。
 
 ---
 
