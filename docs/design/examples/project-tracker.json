@@ -19,6 +19,7 @@
           }
         },
         "fld_cust_owner":   { "kind": "user", "name": "客户经理", "subject": "member" },
+        "fld_cust_email":   { "kind": "text", "name": "联系邮箱", "format": { "kind": "email" }, "required": true, "unique": true },
         "fld_cust_site":    { "kind": "text", "name": "官网", "format": { "kind": "url", "allowedSchemes": ["https"] } },
         "fld_cust_created": { "kind": "createdAt", "name": "建档时间" }
       }

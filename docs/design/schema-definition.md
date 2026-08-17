@@ -613,7 +613,16 @@ widget 自带一个 `AggregateQuery`，而不是指向某个已有 `View`。因�
 
 ## 11. 一个完整的例子
 
-[`examples/project-tracker.json`](examples/project-tracker.json) 是一份能跑通上面所有构件的 `SchemaDefinition`：客户 / 项目 / 任务三张表，四个视图（grid / kanban / grid / form），一个总览仪表盘。挑三段看它长什么样。
+[`examples/project-tracker.json`](examples/project-tracker.json) 是一份能跑通上面所有构件的 `SchemaDefinition`：客户 / 项目 / 任务三张表，四个视图（grid / kanban / grid / form），一个总览仪表盘。挑四段看它长什么样。
+
+**字段：三条正交约束叠出一个邮箱列**（§4.3 / §4.5）
+
+```jsonc
+"fld_cust_email": { "kind": "text", "name": "联系邮箱",
+                    "format": { "kind": "email" }, "required": true, "unique": true }
+```
+
+`format: { kind: "email" }` 不是写一条正则，而是**选中引擎内置的 email DOMAIN**（`CHECK (VALUE ~ '…')`，规则在引擎里，不逐列携带）；`required` = `NOT NULL`、`unique` = `UNIQUE`。三者正交：format 管「是不是邮箱」，required/unique 管「填没填 / 重不重复」。email 格式不带参数 —— 对比同为 text 的 `官网` 用 `url` 还要配 `allowedSchemes`，「合法邮箱」是一条固定规则，没什么可配。
 
 **表：任务，带一个多值自关联和一个 generated column**（§4 / §5）
 
